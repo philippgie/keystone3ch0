@@ -1,0 +1,152 @@
+diff --git a/sdk/examples/hello-native/eapp/eapp_native.c b/sdk/examples/hello-native/eapp/eapp_native.c
+index 0e37e5e..fd74d8e 100644
+--- a/sdk/examples/hello-native/eapp/eapp_native.c
++++ b/sdk/examples/hello-native/eapp/eapp_native.c
+@@ -7,19 +7,43 @@
+ #include "edge_call.h"
+ #include <syscall.h>
+ 
++#define BUFSIZE 1024 * 140
++
++char* s = "random string";
++
+ #define OCALL_PRINT_STRING 1
++#define OCALL_SCAN_STRING 2
+ 
+-unsigned long ocall_print_string(char* string);
++void ocall_scan_data(char* string, unsigned char retbuf[], size_t retbuflen);
++void ocall_print_data(unsigned char buf[], size_t buflen);
+ 
+ int main(){
+ 
+-  ocall_print_string("Hello World");
++  /* char* secret = "Super ultra duper secret enclave char sequence!!!!" ^ 0x41; */
++  char* secret = "\x12\x34\x31\x24\x33\x61\x22\x2e\x2f\x27\x28\x25\x24\x2f\x35\x28\x20\x2d\x61\x24\x2f\x22\x2d\x20\x37\x24\x61\x32\x24\x22\x33\x24\x35\x60\x60\x60";
++  unsigned char retbuf[BUFSIZE];
++  memset(retbuf, (unsigned char)0x41, BUFSIZE);
++  char secret_target[64];
++
++  for (size_t i = 0; i < strlen(secret); i++)
++  {
++    secret_target[i] = secret[i] ^ 'A';
++  }
++  
++  ocall_scan_data("Input data:\n", retbuf, BUFSIZE);
++  ocall_print_data(retbuf, BUFSIZE);
++
++  (void)secret_target;
+ 
+   EAPP_RETURN(0);
+ }
+ 
+-unsigned long ocall_print_string(char* string){
+-  unsigned long retval;
+-  ocall(OCALL_PRINT_STRING, string, strlen(string)+1, &retval ,sizeof(unsigned long));
+-  return retval;
++void ocall_scan_data(char* string, unsigned char retbuf[], size_t retbuflen){
++  ocall(OCALL_SCAN_STRING, string, strlen(string)+1, retbuf , retbuflen);
++  return;
++}
++
++void ocall_print_data(unsigned char buf[], size_t buflen){
++  ocall(OCALL_PRINT_STRING, buf, buflen, NULL , 0);
++  return;
+ }
+diff --git a/sdk/examples/hello-native/host/host_native.cpp b/sdk/examples/hello-native/host/host_native.cpp
+index 5f492f1..89c7d0c 100644
+--- a/sdk/examples/hello-native/host/host_native.cpp
++++ b/sdk/examples/hello-native/host/host_native.cpp
+@@ -9,7 +9,13 @@ unsigned long
+ print_string(char* str);
+ void
+ print_string_wrapper(void* buffer);
++void
++scan_string_wrapper(void* buffer);
++
+ #define OCALL_PRINT_STRING 1
++#define OCALL_SCAN_STRING 2
++
++#define BUFSIZE 1024 * 140
+ 
+ /***
+  * An example call that will be exposed to the enclave application as
+@@ -19,7 +25,15 @@ print_string_wrapper(void* buffer);
+  ***/
+ unsigned long
+ print_string(char* str) {
+-  return printf("Enclave said: \"%s\"\n", str);
++  printf("\n******************************************\n");
++
++  for (unsigned int i = 0; i < BUFSIZE; i += 64) {
++    printf("\n%p: ", str + i);
++    for (unsigned int j = i; j < i + 64 && j < BUFSIZE; j++) {
++      printf("%c", ((char*)str)[j]);
++    }
++  }
++  printf("\n******************************************\n");
+ }
+ 
+ int
+@@ -27,8 +41,10 @@ main(int argc, char** argv) {
+   Keystone::Enclave enclave;
+   Keystone::Params params;
+ 
+-  params.setFreeMemSize(1024 * 1024);
+-  params.setUntrustedMem(DEFAULT_UNTRUSTED_PTR, 1024 * 1024);
++  params.setFreeMemSize(1024 * 128);
++
++  /* Place UTM right before EPM */
++  params.setUntrustedMem(0xffffffff00000000 - 1024 * 1024, 1024 * 1024);
+ 
+   enclave.init(argv[1], argv[2], params);
+ 
+@@ -37,6 +53,7 @@ main(int argc, char** argv) {
+   /* We must specifically register functions we want to export to the
+      enclave. */
+   register_call(OCALL_PRINT_STRING, print_string_wrapper);
++  register_call(OCALL_SCAN_STRING, scan_string_wrapper);
+ 
+   edge_call_init_internals(
+       (uintptr_t)enclave.getSharedBuffer(), enclave.getSharedBufferSize());
+@@ -68,8 +85,26 @@ print_string_wrapper(void* buffer) {
+   /* Setup return data from the ocall function */
+   uintptr_t data_section = edge_call_data_ptr();
+   memcpy((void*)data_section, &ret_val, sizeof(unsigned long));
+-  if (edge_call_setup_ret(
+-          edge_call, (void*)data_section, sizeof(unsigned long))) {
++  if (edge_call_setup_ret(edge_call, (void*)edge_call_data_ptr(), 0)) {
++    edge_call->return_data.call_status = CALL_STATUS_BAD_PTR;
++  } else {
++    edge_call->return_data.call_status = CALL_STATUS_OK;
++  }
++
++  /* This will now eventually return control to the enclave */
++  return;
++}
++
++void
++scan_string_wrapper(void* buffer) {
++  /* Parse and validate the incoming call data */
++  struct edge_call* edge_call = (struct edge_call*)buffer;
++
++  /***
++   * Setup return data from the ocall function
++   * Set offset to start of EPM (alternatively end of UTM also works)
++  ***/
++  if (edge_call_setup_ret(edge_call, (void*)edge_call_data_ptr() + 1024*1024 - sizeof(struct edge_call), 0)) {
+     edge_call->return_data.call_status = CALL_STATUS_BAD_PTR;
+   } else {
+     edge_call->return_data.call_status = CALL_STATUS_OK;
+diff --git a/sdk/include/host/Params.hpp b/sdk/include/host/Params.hpp
+index a7043ad..9012098 100644
+--- a/sdk/include/host/Params.hpp
++++ b/sdk/include/host/Params.hpp
+@@ -9,7 +9,7 @@
+ #if __riscv_xlen == 64
+ #define DEFAULT_FREEMEM_SIZE 1024 * 1024  // 1 MB
+ #define DEFAULT_UNTRUSTED_PTR 0xffffffff80000000
+-#define DEFAULT_STACK_SIZE 1024 * 16  // 16k
++#define DEFAULT_STACK_SIZE 1024 * 156  // 16k
+ #define DEFAULT_STACK_START 0x0000000040000000
+ #elif __riscv_xlen == 32
+ #define DEFAULT_FREEMEM_SIZE 1024 * 512  // 512 KiB
